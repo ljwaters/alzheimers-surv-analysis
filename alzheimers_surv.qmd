@@ -1,0 +1,413 @@
+---
+title: "Project 3: Alzheimer's Disease Survival Analysis"
+author: "Landon Waters"
+date: "02/24/2025"
+
+format: 
+  html:
+    theme: spacelab  
+    mainfont: verdana
+    highlight-style: github
+    title-block-banner: true
+    embed-resources: true
+---
+
+**Abstract:**
+
+“This dataset contains extensive health information for 2,149 patients, each uniquely identified with IDs ranging from 4751 to 6900. The dataset includes demographic details, lifestyle factors, medical history, clinical measurements, cognitive and functional assessments, symptoms, and a diagnosis of Alzheimer's Disease.  The data is ideal for researchers and data scientists looking to explore factors associated with Alzheimer's, develop predictive models, and conduct statistical analyses.”
+
+This synthetic dataset is sourced from Kaggle because I had concerns about the data integrity of the CDC dataset I previously sourced.  However, for the purpose of the project, pretend that you got it from the CDC. -KLG
+
+**Primary question(s) of interest:**
+
+- What covariates are most closely tied to Alzheimer's diagnosis at age *t*?
+- Can diagnosis time with respect to the dominant covariates be modeled parametrically? Semiparametrically? Try a few regression models and discuss the extent to which they fit the data.
+
+**Source:**
+
+Data source: [“the CDC”](https://www.kaggle.com/datasets/rabieelkharoua/alzheimers-disease-dataset?resource=download)
+
+# 1. Setup
+
+**Set Up Code:**
+
+```{r message=FALSE}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(broom)
+theme_set(theme_bw())
+
+ds <- read_csv('/Users/landon/Desktop/Willamette/Fourth Year/Semester 2/Survival Analysis/Datasets/alzheimers_disease_data.csv')
+
+# Get rid of cols with only one unique value
+ds <- ds[, sapply(ds, function(x) length(unique(x)) > 1)]
+
+# Format our event properly
+ds$Diagnosis <- as.numeric(ds$Diagnosis, levels = c(0, 1))
+```
+
+Our primary variables:
+
+TIME = Age
+
+EVENT = Diagnosis
+
+**Feature Selection**
+
+```{r}
+mod <- glm(Diagnosis ~ ., data = ds, family = binomial)
+
+# Sort coefficients by p-value
+coefs <- summary(mod)$coefficients
+coefs <- coefs[order(coefs[, 4]), ]  # Sort by p-value, take top 4
+```
+
+**Refined Model**
+
+```{r}
+mod2 <- glm(Diagnosis ~ MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL, data = ds, family = binomial)
+summary(mod2)
+
+AIC(mod)
+AIC(mod2) # performs slightly better!
+```
+
+**Check For Multicollinearity**
+
+```{r message=FALSE}
+covariates=ds%>%
+  select(MMSE, FunctionalAssessment, MemoryComplaints, BehavioralProblems, ADL)
+GGally::ggpairs(covariates)
+
+# to detect multicollinearity in regression (>5-10 -> problematic multicollinearity)
+regclass::VIF(mod2) 
+```
+
+**Kaplan Meier Model**
+
+```{r}
+km=survfit(Surv(Age, Diagnosis) ~ 1, data = ds)
+
+tidy_km=tidy(km)
+
+tidy_km=tidy_km %>%
+  rename(
+    surv_prob=estimate,	
+    lower=conf.low,	
+    upper=conf.high
+    ) 
+
+km_plot=tidy_km%>%
+  ggplot(aes(x=time, y=surv_prob)) +
+	geom_step(color="darkgrey", linewidth=1.15) +
+	geom_step(aes(x=time,y=lower), linetype="dotted", linewidth=0.85, color="gray") +
+	geom_step(aes(x=time,y=upper), linetype="dotted", linewidth=0.85, color="gray") +
+	scale_y_continuous(labels=scales::percent_format()) 
+
+km_plot+
+  labs(
+    title="KM Curve",
+    y="P( person is undiagnosed )",
+    x = "Age"
+  )+
+  theme(
+    plot.title = element_text(face="bold")
+  )
+summarise(tidy_km, `Median Survival Time`=median(time), `Minimum Survival Time`=min(time), `Maximum Survival Time`=max(time))
+```
+
+**Weibull Model**
+
+```{r warning=FALSE}
+weibull_mod=survreg(Surv(Age,Diagnosis) ~ MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL, data = ds)
+
+# β (shape)
+beta_weibull <- 1 / weibull_mod$scale  
+# α (scale) — baseline only (i.e., when all covariates = 0)
+intercept <- weibull_mod$coefficients[1]
+alpha_weibull <- exp(intercept)
+
+newdata = tibble(
+  MMSE = mean(ds$MMSE, na.rm = TRUE), 
+  FunctionalAssessment = mean(ds$FunctionalAssessment, na.rm = TRUE),
+  MemoryComplaints = mean(ds$MemoryComplaints, na.rm = TRUE),
+  BehavioralProblems = mean(ds$BehavioralProblems, na.rm = TRUE),
+  ADL = mean(ds$ADL, na.rm = TRUE)
+  )
+
+weibull_pred=predict(weibull_mod, newdata, type="quantile", p=seq(0.01,0.99,0.01), se.fit=T)
+
+pred=tibble(
+	time=weibull_pred$fit,
+	fail_prob=seq(0.01,0.99,0.01),
+	surv_prob=1-fail_prob,
+	std_error=weibull_pred$se.fit,
+	lower=time-qnorm(0.975)*std_error,
+	upper=time+qnorm(0.975)*std_error
+)
+
+km_plot + 
+  geom_line(data = pred, 
+            aes(x=time,y=surv_prob), color="#1E88E5", linewidth=1.15)+
+	geom_line(data = pred, 
+	          aes(x=lower,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107") +
+	geom_line(data = pred, 
+	          aes(x=upper,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107")+
+  labs(
+    title="Weibull Model Over KM Curve",
+    subtitle="Model seems to be overestimating survival probability.",
+    x = "Age",
+    y = "Survival Probability"
+  )+
+  theme(
+    plot.title = element_text(face = "bold")
+  )+
+  xlim(c(60,90))
+```
+
+**Log-Normal Model**
+
+```{r warning=FALSE}
+lognormal_mod = survreg(Surv(Age, Diagnosis) ~ MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL, data = ds, dist = "lognormal")
+
+sigma_lognormal <- lognormal_mod$scale
+mu <- lognormal_mod$coefficients[1]
+
+lognormal_pred=predict(lognormal_mod, newdata, type="quantile", p=seq(0.01,0.99,0.01), se.fit=T)
+
+pred2=tibble(
+	time=lognormal_pred$fit,
+	fail_prob=seq(0.01,0.99,0.01),
+	surv_prob=1-fail_prob,
+	std_error=lognormal_pred$se.fit,
+	lower=time-qnorm(0.975)*std_error,
+	upper=time+qnorm(0.975)*std_error
+)
+
+km_plot + 
+  geom_line(data = pred2, 
+            aes(x=time,y=surv_prob), color="#1E88E5", linewidth=1.15)+
+	geom_line(data = pred2, 
+	          aes(x=lower,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107") +
+	geom_line(data = pred2, 
+	          aes(x=upper,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107")+
+  labs(
+    title="Log-Normal Model Over KM Curve",
+    subtitle="Model seems to be overestimating survival probability.",
+    x = "Age",
+    y = "Survival Probability"
+  )+
+  theme(
+    plot.title = element_text(face = "bold")
+  )+
+  xlim(c(60,90))
+```
+
+**Exponential Fit**
+
+It is bad, don't use.
+
+```{r warning=FALSE}
+exp_mod = survreg(Surv(Age, Diagnosis) ~ MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL, data = ds, dist = "exp")
+
+# Intercept-only model:
+lambda_exp <- 1 / exp(exp_mod$coefficients[1])
+
+exp_pred=predict(exp_mod, newdata, type="quantile", p=seq(0.01,0.99,0.01), se.fit=T)
+
+pred3=tibble(
+	time=exp_pred$fit,
+	fail_prob=seq(0.01,0.99,0.01),
+	surv_prob=1-fail_prob,
+	std_error=exp_pred$se.fit,
+	lower=time-qnorm(0.975)*std_error,
+	upper=time+qnorm(0.975)*std_error
+)
+
+km_plot + 
+  geom_line(data = pred3, 
+            aes(x=time,y=surv_prob), color="#1E88E5", linewidth=1.15)+
+	geom_line(data = pred3, 
+	          aes(x=lower,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107") +
+	geom_line(data = pred3, 
+	          aes(x=upper,y=surv_prob),linetype="dashed",linewidth=0.75,color="#FFC107")+
+  labs(
+    title="Exponential Model Over KM Curve",
+    subtitle = "Does not fit the data very well...",
+    x = "Age",
+    y = "Survival Probability"
+  )+
+  theme(
+    plot.title = element_text(face = "bold")
+  )+
+  xlim(c(60,90))
+```
+
+**AIC Comparisons**
+
+```{r}
+AIC(weibull_mod)
+AIC(lognormal_mod)
+AIC(exp_mod)
+```
+
+Weibull and log-normal are comparable. 
+
+**By Gender**
+
+Two-thirds of clinically diagnosed cases of dementia and AD are women [(source)](https://pmc.ncbi.nlm.nih.gov/articles/PMC6226313/)
+
+```{r}
+km_gender=survfit(Surv(Age, Diagnosis) ~ Gender, data = ds)
+
+tidy_km_gender=tidy(km_gender)
+
+tidy_km_gender=tidy_km_gender %>%
+  rename(
+    surv_prob=estimate,	
+    lower=conf.low,	
+    upper=conf.high
+    ) 
+
+km_plot_gender=tidy_km_gender%>%
+  ggplot(aes(x=time, y=surv_prob, color=strata)) +
+	geom_step(linewidth=1.15) +
+	geom_step(aes(x=time,y=lower), linetype="dotted", linewidth=0.85, color="gray") +
+	geom_step(aes(x=time,y=upper), linetype="dotted", linewidth=0.85, color="gray") +
+	scale_y_continuous(labels=scales::percent_format())+
+  scale_color_viridis_d(labels = c("0", "1"))+
+  labs(
+    title = "KM Model by Gender",
+    y="Survival Probability",
+    x = "Age",
+    color="Gender"
+  )
+km_plot_gender
+```
+
+**Log Rank Test**
+
+```{r}
+survdiff(Surv(Age, Diagnosis) ~ Gender, data = ds)
+```
+
+**Weibull Plot by Gender**
+
+When survival is being predicted for multiple groups/strata, you may color-code the points and determine if
+
+1) the points in each group fall along a straight line and 
+2) the lines formed by each group are parallel to each other. 
+
+If point patterns are linear but not parallel to each other, it suggests that the Weibull model may be appropriate, but the groups do not share the same shape parameter.
+
+```{r message=FALSE}
+km_gender = survfit(Surv(Age, Diagnosis) ~ Gender, data = ds)
+km_data <- tidy(km_gender)
+km_data <- km_data %>%
+  mutate(
+    log_time = log(time),
+    log_log_est = log(-log(estimate))
+  )
+
+km_data <- km_data %>%
+  mutate(
+    log_time = log(time),
+    log_log_est = log(-log(estimate))
+  )
+
+ggplot(km_data, aes(x = log_time, y = log_log_est, color = strata)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  scale_color_viridis_d(labels = c("0", "1"))+
+  labs(
+    title = "Weibull Plot of Alzheiemer's Survival",
+    subtitle = "Mostly linear points and parallel lines.",
+    x = "Log(Failure Time)",
+    y = "Log(-Log(Survival Probability))",
+    color = "Gender"
+  )
+```
+
+Equal shape parameters seems to be okay.
+
+**Weibull By Gender**
+
+```{r warning=FALSE}
+km_gender_ds=tidy(km_gender) %>%
+	rename(surv_prob=estimate, Gender=strata) %>%
+	mutate(Gender=str_remove_all(Gender,"Gender=")) %>%
+	select(time,surv_prob,Gender)
+
+weibull_gender=survreg(Surv(Age,Diagnosis) ~ Gender, data = ds)
+summary(weibull_gender)
+
+weibull_pred=predict(weibull_gender,newdata=tibble(Gender=c("0","1")),type="quantile",p=seq(0.01,0.99,0.01),se.fit=T)
+
+pred_gender=tibble(quantile=seq(0.01,0.99,0.01),	as.data.frame(t(weibull_pred$fit)) )
+names(pred_gender)=c("quantile",c("0","1"))
+
+pred_gender %>%
+	pivot_longer(`0`:`1`,names_to="Gender",values_to = "Diagnosis") %>%
+	ggplot(aes(x=Diagnosis,y=rev(quantile),color=Gender)) +
+	geom_line(linewidth=1.1) +
+	geom_step(data=km_gender_ds, aes(x=time,y=surv_prob, color=Gender), linetype="dashed") +
+	facet_wrap(Gender~.)+
+  scale_color_viridis_d(labels = c("0", "1"))+
+  labs(
+    title="Weibull Model Over KM Curve",
+    subtitle="Stratified by Gender",
+    x = "Age",
+    y = "Survival Probability"
+  )+
+  theme(
+    plot.title = element_text(face = "bold")
+  )+
+  xlim(c(60,90))
+```
+
+**Weibull Model Comparison**
+
+```{r}
+AIC(weibull_mod)
+AIC(weibull_gender)
+```
+
+
+**Semi-Parametric**
+
+```{r}
+cox_mod = coxph(Surv(Age, Diagnosis) ~ MMSE + FunctionalAssessment + MemoryComplaints + BehavioralProblems + ADL, data = ds)
+#summary(cox_mod)
+
+cox_fit = survfit(cox_mod)
+
+cox_df = tidy(cox_fit) %>%
+  rename(
+    surv_prob=estimate,	
+    lower=conf.low,	
+    upper=conf.high
+    ) 
+  
+km_plot +
+  geom_step(data = cox_df, 
+            aes(x = time, y = surv_prob), color = "#1E88E5") +
+	geom_step(data = cox_df, 
+	          aes(x=time,y=lower), linetype="dotted", linewidth=0.85, color="#FFC107") +
+	geom_step(data = cox_df, 
+	          aes(x=time,y=upper), linetype="dotted", linewidth=0.85, color="#FFC107") +
+  labs(
+    title = "Kaplan-Meier Survival Curves vs. Cox PH Model",
+    x = "Time",
+    y = "Survival Probability"
+  ) +
+  scale_y_continuous(labels = scales::percent_format())
+
+```
+
+
+
+
+
+
+
